@@ -23,7 +23,38 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+const (
+	CoordinatorStateMap    = 1
+	CoordinatorStateReduce = 2
+	CoordinatorStateDone   = 3
 
+	CoordinatorStateWait = 6
+)
+
+type Job struct {
+	ID       string
+	Index    int
+	JobType  string
+	FileName string
+	NReduce  int
+	NMap     int
+}
+
+type PullJobReq struct {
+}
+
+type PullJobRsp struct {
+	State int
+	Job   *Job
+}
+
+type CommitJobReq struct {
+	JobID string
+	Suc   bool
+}
+
+type CommitJobRsp struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
