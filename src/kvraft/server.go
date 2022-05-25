@@ -4,12 +4,16 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
+const timeOut = 1 * time.Second
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +22,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpType      OpType
+	Key, Value  string
+	ClerkID     int64
+	SequenceNum int64
 }
 
 type KVServer struct {
@@ -35,15 +42,83 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	state              *KvState
+	lastSequenceNumMap map[int64]int64
+	resultChnMap       map[string]chan result
 }
 
+type result struct {
+	err        Err
+	key, value string
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	getOp := Op{
+		OpType:      GET,
+		Key:         args.Key,
+		ClerkID:     args.ClerkID,
+		SequenceNum: args.SequenceNum,
+	}
+
+	res := kv.startOp(getOp)
+
+	reply.Err = res.err
+	reply.Value = res.value
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	if lastSeq, ok := kv.lastSequenceNumMap[args.ClerkID]; ok && lastSeq >= args.SequenceNum {
+		kv.mu.Unlock()
+		reply.Err = OK
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		OpType:      args.Op,
+		Key:         args.Key,
+		Value:       args.Value,
+		ClerkID:     args.ClerkID,
+		SequenceNum: args.SequenceNum,
+	}
+	res := kv.startOp(op)
+
+	reply.Err = res.err
+	return
+}
+
+func (kv *KVServer) startOp(op Op) result {
+	var res result
+	index, term, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		res.err = ErrWrongLeader
+		return res
+	}
+
+	resChn := make(chan result)
+	resultKey := getResultChnKey(term, index)
+	kv.mu.Lock()
+	kv.resultChnMap[resultKey] = resChn
+	kv.mu.Unlock()
+
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.resultChnMap, resultKey)
+		kv.mu.Unlock()
+		close(resChn)
+	}()
+
+	select {
+	case res = <-resChn:
+		return res
+	case <-time.After(timeOut):
+		res.err = ErrTimeOut
+		return res
+	}
 }
 
 //
@@ -65,6 +140,70 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) applyMsg() {
+	for !kv.killed() {
+		for msg := range kv.applyCh {
+
+			DPrintf("applyMsg msg: %+v", msg)
+
+			kv.applyCommandMsg(msg)
+		}
+	}
+}
+
+func (kv *KVServer) applyCommandMsg(msg raft.ApplyMsg) {
+	op, _ := msg.Command.(Op)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	res := kv.applyMsgToState(op)
+
+	key := getResultChnKey(msg.CommandTerm, msg.CommandIndex)
+	resultChn, ok := kv.resultChnMap[key]
+
+	if ok {
+		select {
+		case resultChn <- res:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (kv *KVServer) applyMsgToState(op Op) result {
+	var res result
+	lastSeqID, ok := kv.lastSequenceNumMap[op.ClerkID]
+	if ok && lastSeqID >= op.SequenceNum && op.OpType != GET {
+		res.err = OK
+		return res
+	}
+
+	switch op.OpType {
+	case GET:
+		res.value, res.err = kv.state.Get(op.Key)
+	case PUT:
+		kv.state.Put(op.Key, op.Value)
+		res.err = OK
+	case APPEND:
+		kv.state.Append(op.Key, op.Value)
+		res.err = OK
+	default:
+		log.Fatalf("un know op type: %s", op.OpType)
+	}
+
+	kv.lastSequenceNumMap[op.ClerkID] = op.SequenceNum
+
+	return res
+}
+
+func (kv *KVServer) generateSnapshot() *bytes.Buffer {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	_ = e.Encode(kv.state)
+	_ = e.Encode(kv.lastSequenceNumMap)
+	return w
 }
 
 //
@@ -94,8 +233,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.state = NewKvState()
+	kv.lastSequenceNumMap = map[int64]int64{}
+	kv.resultChnMap = map[string]chan result{}
 
-	// You may need initialization code here.
-
+	go kv.applyMsg()
 	return kv
+}
+
+func getResultChnKey(term int, index int) string {
+	return fmt.Sprintf("%d_%d", term, index)
 }

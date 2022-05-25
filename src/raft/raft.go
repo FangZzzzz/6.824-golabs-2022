@@ -63,6 +63,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -859,6 +860,7 @@ func (rf *Raft) applyLoop() {
 				CommandValid: true,
 				Command:      rf.log.get(rf.lastApplied).Command,
 				CommandIndex: rf.lastApplied,
+				CommandTerm:  rf.currentTerm,
 			})
 		}
 
