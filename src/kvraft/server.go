@@ -44,7 +44,10 @@ type KVServer struct {
 	// Your definitions here.
 	state              *KvState
 	lastSequenceNumMap map[int64]int64
+	appliedIndex       int
 	resultChnMap       map[string]chan result
+
+	lastSnapshotIndex int
 }
 
 type result struct {
@@ -52,6 +55,12 @@ type result struct {
 	key, value string
 }
 
+// Get
+// TODO read index
+// 1、确定leader在该任期内提交过log（保证leader commit index是最新的）
+// 2、取leader commit index 作为read index
+// 3、发心跳确认leader地位
+// 4、待apply到read index位置，读状态机返回
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	getOp := Op{
@@ -145,11 +154,46 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applyMsg() {
 	for !kv.killed() {
 		for msg := range kv.applyCh {
-
 			DPrintf("applyMsg msg: %+v", msg)
-
+			if msg.SnapshotValid {
+				kv.applySnapshotMsg(msg)
+				continue
+			}
 			kv.applyCommandMsg(msg)
+
+			kv.doSnapshot()
 		}
+	}
+}
+
+func (kv *KVServer) doSnapshot() {
+	const (
+		snapshotLogGap = 20
+	)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.maxraftstate == -1 {
+		return
+	}
+
+	if int(float64(kv.maxraftstate)*0.8) <= kv.rf.GetCurrentStateSize() &&
+		kv.appliedIndex-kv.lastSnapshotIndex >= snapshotLogGap {
+		snapshot := kv.generateSnapshot()
+		kv.rf.Snapshot(kv.appliedIndex, snapshot)
+		kv.lastSnapshotIndex = kv.appliedIndex
+	}
+}
+
+func (kv *KVServer) applySnapshotMsg(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+		kv.readStateFromSnapshot(msg.Snapshot)
+		kv.appliedIndex = msg.SnapshotIndex
+		kv.lastSnapshotIndex = kv.appliedIndex
 	}
 }
 
@@ -159,7 +203,13 @@ func (kv *KVServer) applyCommandMsg(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	// 理论上在raft层已经做过严格保证有序了，不会出现这种情况。
+	if kv.appliedIndex >= msg.CommandIndex {
+		return
+	}
+
 	res := kv.applyMsgToState(op)
+	kv.appliedIndex = msg.CommandIndex
 
 	key := getResultChnKey(msg.CommandTerm, msg.CommandIndex)
 	resultChn, ok := kv.resultChnMap[key]
@@ -198,12 +248,31 @@ func (kv *KVServer) applyMsgToState(op Op) result {
 	return res
 }
 
-func (kv *KVServer) generateSnapshot() *bytes.Buffer {
+func (kv *KVServer) generateSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	_ = e.Encode(kv.state)
 	_ = e.Encode(kv.lastSequenceNumMap)
-	return w
+	_ = e.Encode(kv.appliedIndex)
+	return w.Bytes()
+}
+
+func (kv *KVServer) readStateFromSnapshot(snapshot []byte) {
+	r := bytes.NewBuffer(snapshot)
+
+	d := labgob.NewDecoder(r)
+
+	newState := NewKvState()
+	newLastSequenceNumMap := map[int64]int64{}
+	newAppliedIndex := 0
+
+	d.Decode(&newState)
+	d.Decode(&newLastSequenceNumMap)
+	d.Decode(&newAppliedIndex)
+
+	kv.state = newState
+	kv.lastSequenceNumMap = newLastSequenceNumMap
+	kv.appliedIndex = newAppliedIndex
 }
 
 //
@@ -233,9 +302,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
 	kv.state = NewKvState()
 	kv.lastSequenceNumMap = map[int64]int64{}
 	kv.resultChnMap = map[string]chan result{}
+	kv.appliedIndex = 0
+
+	if persister.SnapshotSize() > 0 {
+		kv.readStateFromSnapshot(persister.ReadSnapshot())
+	}
 
 	go kv.applyMsg()
 	return kv

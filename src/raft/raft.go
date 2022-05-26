@@ -881,3 +881,9 @@ func (rf *Raft) applyLoop() {
 	}
 
 }
+
+func (rf *Raft) GetCurrentStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.persister.RaftStateSize()
+}
