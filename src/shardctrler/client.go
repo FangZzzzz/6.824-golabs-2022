@@ -12,6 +12,8 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	clerkID     int64
+	sequenceNum int64
 }
 
 func nrand() int64 {
@@ -25,19 +27,26 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clerkID = nrand()
+	ck.sequenceNum = 0
+
 	return ck
 }
 
 func (ck *Clerk) Query(num int) Config {
+	ck.sequenceNum += 1
+
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	args.ClerkID = ck.clerkID
+	args.SequenceNum = ck.sequenceNum
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply QueryReply
 			ok := srv.Call("ShardCtrler.Query", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				return reply.Config
 			}
 		}
@@ -46,16 +55,20 @@ func (ck *Clerk) Query(num int) Config {
 }
 
 func (ck *Clerk) Join(servers map[int][]string) {
+	ck.sequenceNum += 1
+
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
+	args.ClerkID = ck.clerkID
+	args.SequenceNum = ck.sequenceNum
 
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply JoinReply
 			ok := srv.Call("ShardCtrler.Join", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				return
 			}
 		}
@@ -64,16 +77,20 @@ func (ck *Clerk) Join(servers map[int][]string) {
 }
 
 func (ck *Clerk) Leave(gids []int) {
+	ck.sequenceNum += 1
+
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
+	args.ClerkID = ck.clerkID
+	args.SequenceNum = ck.sequenceNum
 
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply LeaveReply
 			ok := srv.Call("ShardCtrler.Leave", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				return
 			}
 		}
@@ -82,17 +99,21 @@ func (ck *Clerk) Leave(gids []int) {
 }
 
 func (ck *Clerk) Move(shard int, gid int) {
+	ck.sequenceNum += 1
+
 	args := &MoveArgs{}
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
+	args.ClerkID = ck.clerkID
+	args.SequenceNum = ck.sequenceNum
 
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
 			var reply MoveReply
 			ok := srv.Call("ShardCtrler.Move", args, &reply)
-			if ok && reply.WrongLeader == false {
+			if ok && reply.Err == OK {
 				return
 			}
 		}
