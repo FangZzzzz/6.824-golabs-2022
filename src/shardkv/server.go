@@ -1,17 +1,23 @@
 package shardkv
 
-
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"6.824/shardctrler"
+	"log"
+	"sync/atomic"
+	"time"
+)
 import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
+const Debug = false
 
-
-type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
 }
 
 type ShardKV struct {
@@ -25,15 +31,18 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-}
+	mck *shardctrler.Clerk
 
+	dead int32
 
-func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-}
+	preCfg shardctrler.Config
+	curCfg shardctrler.Config
 
-func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	state *ShardState
+
+	appliedIndex int
+
+	resultChnMap map[string]chan result
 }
 
 //
@@ -45,8 +54,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
 }
 
+func (kv *ShardKV) killed() bool {
+	z := atomic.LoadInt32(&kv.dead)
+	return z == 1
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -91,11 +105,33 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Your initialization code here.
 
 	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.state = NewShardState()
+	kv.resultChnMap = map[string]chan result{}
+	kv.appliedIndex = 0
+
+	if persister.SnapshotSize() > 0 {
+		kv.readStateFromSnapshot(persister.ReadSnapshot())
+	}
+
+	go kv.applyMsg()
+	go kv.leaderGo(kv.pullConfig, pullConfigInterval)
+	go kv.leaderGo(kv.pullShard, pullShardInterval)
+	go kv.leaderGo(kv.gcShard, gcShardInterval)
+	go kv.leaderGo(kv.debugShardStatus, debugShardStatusInterval)
 
 	return kv
+}
+
+func (kv *ShardKV) leaderGo(handler func(), timeout time.Duration) {
+	for kv.killed() == false {
+		if _, isLeader := kv.rf.GetState(); isLeader {
+			handler()
+		}
+		time.Sleep(timeout)
+	}
 }
